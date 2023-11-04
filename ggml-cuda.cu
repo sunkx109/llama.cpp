@@ -145,8 +145,8 @@ static_assert(sizeof(block_q5_1) == 2 * sizeof(ggml_fp16_t) + sizeof(uint32_t) +
 #define QR8_0 1
 #define QI8_0 (QK8_0 / (4 * QR8_0))
 typedef struct {
-    half    d;              // delta
-    int8_t  qs[QK8_0];      // quants
+    half    d;              // delta 量化的scale
+    int8_t  qs[QK8_0];      // quants 量化的weight数据
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_fp16_t) + QK8_0, "wrong q8_0 block size/padding");
 
@@ -342,6 +342,7 @@ static __global__ void silu_f32(const float * x, float * dst, const int k) {
     if (i >= k) {
         return;
     }
+    //silu公式
     dst[i] = x[i] / (1.0f + expf(-x[i]));
 }
 
@@ -376,26 +377,28 @@ static __global__ void norm_f32(const float * x, float * dst, const int ncols) {
     }
 }
 
+//kernel code
 static __global__ void rms_norm_f32(const float * x, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     const int tid = threadIdx.x;
 
     float tmp = 0.0f; // partial sum for thread in warp
-
+    //一个线程求和(ncols/WARP_SIZE)个数据的x^2 
     for (int col = tid; col < ncols; col += WARP_SIZE) {
         const float xi = x[row*ncols + col];
         tmp += xi * xi;
     }
-
+    
     // sum up partial sums
+    // 一个线程束(32个线程)内的归约求和
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         tmp += __shfl_xor_sync(0xffffffff, tmp, mask, 32);
     }
-
-    const float mean = tmp / ncols;
-    const float scale = rsqrtf(mean + eps);
-
+    
+    const float mean = tmp / ncols; // mean(x^2)
+    const float scale = rsqrtf(mean + eps); // 1/根号mean
+    //算完之后写回原数组
     for (int col = tid; col < ncols; col += WARP_SIZE) {
         dst[row*ncols + col] = scale * x[row*ncols + col];
     }
@@ -488,18 +491,22 @@ static __device__ __forceinline__ void dequantize_q5_1(const void * vx, const in
 }
 
 static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int ib, const int iqs, dfloat2 & v){
+    //因为此时的int8量化是采用的是均匀对称量化
+    //根据量化公式，反量化就是int8 * scale
     const block_q8_0 * x = (const block_q8_0 *) vx;
 
-    const dfloat d = x[ib].d;
+    const dfloat d = x[ib].d; //scale
 
-    v.x = x[ib].qs[iqs + 0];
-    v.y = x[ib].qs[iqs + 1];
+    v.x = x[ib].qs[iqs + 0]; //int8 weight 
+    v.y = x[ib].qs[iqs + 1]; //int8 weight 
 
 #ifdef GGML_CUDA_F16
+    //FP16的情况
     v = __hmul2(v, {d, d});
 #else
-    v.x *= d;
-    v.y *= d;
+    //FP32的情况
+    v.x *= d; //反量化
+    v.y *= d; //反量化
 #endif // GGML_CUDA_F16
 }
 
@@ -1313,40 +1320,40 @@ static __device__ void convert_f16(const void * vx, const int ib, const int iqs,
 }
 
 static __global__ void quantize_q8_1(const float * __restrict__ x, void * __restrict__ vy, const int kx, const int kx_padded) {
-    const int ix = blockDim.x*blockIdx.x + threadIdx.x;
+    const int ix = blockDim.x*blockIdx.x + threadIdx.x; //0-4096
 
     if (ix >= kx_padded) {
         return;
     }
+    const int iy = blockDim.y*blockIdx.y + threadIdx.y; //0
+    const int i_padded = iy*kx_padded + ix; //ix
+    block_q8_1 * y = (block_q8_1 *) vy; 
 
-    const int iy = blockDim.y*blockIdx.y + threadIdx.y;
+    const int ib = i_padded / QK8_1; // block index  因为结构体数据是以32为一组，所以ib计算得到当前数据所在结构体block的index
+    const int iqs = i_padded % QK8_1; // quant index iqs计算的就是当前数据所在结构体内部的index
 
-    const int i_padded = iy*kx_padded + ix;
-
-    block_q8_1 * y = (block_q8_1 *) vy;
-
-    const int ib = i_padded / QK8_1; // block index
-    const int iqs = i_padded % QK8_1; // quant index
-
-    const float xi = ix < kx ? x[iy*kx + ix] : 0.0f;
-    float amax = fabsf(xi);
+    const float xi = ix < kx ? x[iy*kx + ix] : 0.0f; //防止超出
+    float amax = fabsf(xi); // 当前数据的绝对值
     float sum = xi;
-
+   
+    //一个block内部既做归约求和也做归约求最大值
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, mask, 32));
         sum += __shfl_xor_sync(0xffffffff, sum, mask, 32);
     }
-
+    //套用均匀对称量化的量化公式
+    //q = round(clip(r_i /scale,Q_{min},Q_{max}))
+    //scale = fmax-fmin/qmax-qmin 
     const float d = amax / 127;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
-
+    //存储量化后的值
     y[ib].qs[iqs] = q;
-
+  
     if (iqs > 0) {
         return;
     }
-
+    //只用iqs==0的线程将scale和sum写回
     y[ib].ds.x = d;
     y[ib].ds.y = sum;
 }
@@ -3684,17 +3691,19 @@ template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows) {
     // qk = quantized weights per x block
     // qr = number of quantized weights per data value in x block
-    const int row = blockIdx.y*blockDim.y + threadIdx.y;
+  
+    const int row = blockIdx.y*blockDim.y + threadIdx.y;  //0-4095
 
     if (row >= nrows) {
         return;
     }
 
-    const int tid = threadIdx.x;
+    const int tid = threadIdx.x; //0-31
 
-    const int iter_stride = 2*GGML_CUDA_DMMV_X;
-    const int vals_per_iter = iter_stride / WARP_SIZE; // num quantized vals per thread and i iter
-    const int y_offset = qr == 1 ? 1 : qk/2;
+    const int iter_stride = 2*GGML_CUDA_DMMV_X; // 2 * 32
+    const int vals_per_iter = iter_stride / WARP_SIZE; //2  num quantized vals per thread and i iter
+                                                       //单个线程，for循环的一次迭代所处理的数据量--2
+    const int y_offset = qr == 1 ? 1 : qk/2; // 1
 
 // partial sum for each thread
 #ifdef GGML_CUDA_F16
@@ -3702,22 +3711,24 @@ static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, cons
 #else
     float tmp = 0.0f;
 #endif // GGML_CUDA_F16
-
+    //32个线程需要处理4096组数据的乘加
+    
     for (int i = 0; i < ncols; i += iter_stride) {
-        const int col = i + vals_per_iter*tid;
-        const int ib = (row*ncols + col)/qk; // x block index
-        const int iqs = (col%qk)/qr; // x quant index
-        const int iybs = col - col%qk; // y block start index
+        const int col = i + vals_per_iter*tid; //列坐标，因为一个线程一次for循环迭代处理两个数据，所以32个线程一次迭代可以处理64个数据
+        const int ib = (row*ncols + col)/qk; // x block index ，就是weight数据的第几个block结构体
+        const int iqs = (col%qk)/qr; // x quant index，当前列坐标所对应的weight数据block结构体内部的第几个索引
+        const int iybs = col - col%qk; // y block start index，与当前weight数据block 对应的input_tensor的起始index
 
 // processing >2 values per i iter is faster for fast GPUs
+        //前面说过一个线程每次迭代都处理两个数据，向量化存取有效利用量化所节省的带宽
 #pragma unroll
         for (int j = 0; j < vals_per_iter; j += 2) {
             // process 2 vals per j iter
 
             // dequantize
             // for qr = 2 the iqs needs to increase by 1 per j iter because 2 weights per data val
-            dfloat2 v;
-            dequantize_kernel(vx, ib, iqs + j/qr, v);
+            dfloat2 v; //float2类型，就是两个float
+            dequantize_kernel(vx, ib, iqs + j/qr, v); //反量化之后的数据存到v
 
             // matrix multiplication
             // for qr = 2 the y index needs to increase by 1 per j iter because of y_offset = qk/2
@@ -3727,18 +3738,20 @@ static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, cons
                 y[iybs + iqs + j/qr + y_offset]
             });
 #else
-            tmp += v.x * y[iybs + iqs + j/qr + 0];
+            //两个数据分别相乘后相加
+            tmp += v.x * y[iybs + iqs + j/qr + 0]; 
             tmp += v.y * y[iybs + iqs + j/qr + y_offset];
 #endif // GGML_CUDA_F16
         }
     }
 
     // sum up partial sums and write back result
+    //对每个block中的tmp进行累和，即为每一行weight与input_tensor进行乘加后的结果
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         tmp += __shfl_xor_sync(0xffffffff, tmp, mask, 32);
     }
-
+    //当tid=0时再把每个block的结果写会结果
     if (tid == 0) {
 #ifdef GGML_CUDA_F16
         dst[row] = tmp.x + tmp.y;
@@ -3748,97 +3761,111 @@ static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, cons
     }
 }
 
+// gridDim = {1,seq_len,32} ,blockDim = {32,1,1}
 static __global__ void mul_mat_p021_f16_f32(
     const void * __restrict__ vx, const float * __restrict__ y, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nchannels_x, const int nchannels_y) {
 
-    const half * x = (const half *) vx;
+    const half * x = (const half *) vx; //vx就是K cache
 
-    const int row_x = blockDim.y*blockIdx.y + threadIdx.y;
-    const int channel = blockDim.z*blockIdx.z + threadIdx.z;
-    const int channel_x = channel / (nchannels_y / nchannels_x);
+    const int row_x = blockDim.y*blockIdx.y + threadIdx.y; //这个维度是seq_len 的索引，[0,..,seq_len-1]
+    const int channel = blockDim.z*blockIdx.z + threadIdx.z; //这个维度是multi head的索引[0,1,2..,31]
+    const int channel_x = channel / (nchannels_y / nchannels_x);//这个是对于GQA的时候用的，就是Q分组共享K cache
+                                                                //此处我们是以7B模型为例，依然是MHA
 
-    const int nrows_y = ncols_x;
-    const int nrows_dst = nrows_x;
-    const int row_dst = row_x;
+    const int nrows_y = ncols_x;  //128
+    const int nrows_dst = nrows_x;//seq_len
+    const int row_dst = row_x; //[0,..,seq_len-1]
 
     float tmp = 0.0f;
-
+    //因为一个block(32个线程)处理128个数据，所以每个线程for循环迭代次数为128/32
     for (int col_x0 = 0; col_x0 < ncols_x; col_x0 += blockDim.x) {
-        const int col_x = col_x0 + threadIdx.x;
+        const int col_x = col_x0 + threadIdx.x; //计算列索引[0-127]
 
         if (col_x >= ncols_x) {
             break;
         }
 
         // x is transposed and permuted
+        // 计算K cache的index
+        // 前面说过K cache在内存存的次序还是[seq_len , multihead , head_dim]
+        // 所以这里的index的计算方式 理解一下
         const int ix = row_x*nchannels_x*ncols_x + channel_x*ncols_x + col_x;
+        //K cache不是为了节省内存用的FP16存着嘛，所以用一个__half2float内置函数将FP16转换为FP32
         const float xi = __half2float(x[ix]);
-
+        //K cache的列索引 等于 Q的 列索引
+        //名字叫row_y但还是列索引，因为Q的内存排布还是[32,128]
         const int row_y = col_x;
 
-
         // y is not transposed but permuted
-        const int iy = channel*nrows_y + row_y;
+        const int iy = channel*nrows_y + row_y;//计算Q的全局index
 
-        tmp += xi * y[iy];
+        tmp += xi * y[iy]; //乘后累和到tmp
     }
 
     // dst is not transposed and not permuted
+    //dst的shape为[32,1,seq_len] ,所以内存排布为[32,seq_len]
+    //所以dst的index计算方式如下
     const int idst = channel*nrows_dst + row_dst;
 
     // sum up partial sums and write back result
+    // 又是熟悉的block内求和
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         tmp += __shfl_xor_sync(0xffffffff, tmp, mask, 32);
     }
 
     if (threadIdx.x == 0) {
-        dst[idst] = tmp;
+        dst[idst] = tmp;//写回dst
     }
 }
 
+//gridDim={1,128,32},blockDim={32,1,1}
 static __global__ void mul_mat_vec_nc_f16_f32( // nc == non-contiguous
     const void * __restrict__ vx, const float * __restrict__ y, float * __restrict__ dst, const int ncols_x, const int nrows_x,
     const int row_stride_x, const int channel_stride_x, const int channel_x_divisor) {
+    //ncols_x = seq_len, nrows_x=128, row_stride_x=512 , channel_stride_x = 65536, channel_x_divisor=1
 
-    const half * x = (const half *) vx;
+    const half * x = (const half *) vx; //V cache 存储时使用的FP16
 
-    const int row_x = blockDim.y*blockIdx.y + threadIdx.y;
-    const int channel = blockDim.z*blockIdx.z + threadIdx.z;
-    const int channel_x = channel / channel_x_divisor;
+    const int row_x = blockDim.y*blockIdx.y + threadIdx.y; // index of head_dim ->  0-127
+    const int channel = blockDim.z*blockIdx.z + threadIdx.z; // index of multi-head -> 0-31
+    const int channel_x = channel / channel_x_divisor; // channel/1
 
-    const int nrows_y = ncols_x;
-    const int nrows_dst = nrows_x;
-    const int row_dst = row_x;
-
-    const int idst = channel*nrows_dst + row_dst;
+    const int nrows_y = ncols_x; //seq_len
+    const int nrows_dst = nrows_x; //128
+    const int row_dst = row_x; // index of head_dim ->  0-127
+    
+    //Attention Score * V 最终的shape为[1,32,1,128]
+    //所以idst = （index of multi-head） * (128) + (index of head_dim)
+    const int idst = channel*nrows_dst + row_dst; 
 
     float tmp = 0.0f;
-
+    //循环处理seq_len序列，每个线程处理seq_len/blockDim.x 个数
     for (int col_x0 = 0; col_x0 < ncols_x; col_x0 += blockDim.x) {
         const int col_x = col_x0 + threadIdx.x;
 
         if (col_x >= ncols_x) {
             break;
         }
-
+        // V cache的index
         const int ix = channel_x*channel_stride_x + row_x*row_stride_x + col_x;
+        //fp16转fp32
         const float xi = __half2float(x[ix]);
-
+        // Attention Score index
         const int row_y = col_x;
-
         const int iy = channel*nrows_y + row_y;
 
-        tmp += xi * y[iy];
+        tmp += xi * y[iy]; //乘加
     }
 
     // sum up partial sums and write back result
+    //还是熟悉的block内部求和
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         tmp += __shfl_xor_sync(0xffffffff, tmp, mask, 32);
     }
-
+    //结果写回
     if (threadIdx.x == 0) {
         dst[idst] = tmp;
     }
@@ -3867,45 +3894,53 @@ static __global__ void cpy_f32_f16(const char * cx, char * cdst, const int ne,
     if (i >= ne) {
         return;
     }
-
     // determine indices i02/i12, i01/i11, i00/i10 as a function of index i of flattened tensor
     // then combine those indices with the corresponding byte offsets to get the total offsets
-    const int i02 = i / (ne00*ne01);
-    const int i01 = (i - i02*ne01*ne00) / ne00;
-    const int i00 = i - i02*ne01*ne00 - i01*ne00;
-    const int x_offset = i00*nb00 + i01*nb01 + i02*nb02;
-
-    const int i12 = i / (ne10*ne11);
+    // 结合之前的ggml_tensor的ne 和 nb的定义
+    // nb[i] = nb[i-1] * ne[i-1] , nb[0] =sizeof(type)
+  
+    const int i02 = i / (ne00*ne01); //the index of ne02 
+    const int i01 = (i - i02*ne01*ne00) / ne00; //the index of ne01 
+    const int i00 = i - i02*ne01*ne00 - i01*ne00; //the index of ne00
+    const int x_offset = i00*nb00 + i01*nb01 + i02*nb02; //计算偏移
+   
+    const int i12 = i / (ne10*ne11); //dst同上
     const int i11 = (i - i12*ne10*ne11) / ne10;
     const int i10 = i - i12*ne10*ne11 - i11*ne10;
     const int dst_offset = i10*nb10 + i11*nb11 + i12*nb12;
 
-    cpy_1(cx + x_offset, cdst + dst_offset);
+    cpy_1(cx + x_offset, cdst + dst_offset); //将cx[x_offset] 转换为fp16写到cdst[dst_offset]
 }
 
 // rope == RoPE == rotary positional embedding
+//(1,32,1)  (512 ,1,1)
 static __global__ void rope_f32(const float * x, float * dst, const int ncols, const float p0,
                                 const float p_delta, const int p_delta_rows, const float theta_scale) {
-    const int col = 2*(blockDim.x*blockIdx.x + threadIdx.x);
-
+  
+    const int col = 2*(blockDim.x*blockIdx.x + threadIdx.x); //0-1022
+    //ncols =128
     if (col >= ncols) {
         return;
     }
-
-    const int row = blockDim.y*blockIdx.y + threadIdx.y;
-    const int i = row*ncols + col;
-
+    //做了截断所以col的值域为{0，2，4...126} 
+    //其实这里不是太懂为什么要512个线程处理，然后又做截断，实际每个block只有64个线程进行了后续运算
+    const int row = blockDim.y*blockIdx.y + threadIdx.y; //0-31
+    const int i = row*ncols + col; //数据的索引
+    //p0 = n_past 就是在生成当前token之前已处理的token长度
+    //p_delta = 1.0
+    //theta_scale = 0.865964
+    //p_delta_rows = 32
     const float theta = (p0 + p_delta * (row/p_delta_rows))*powf(theta_scale, col/2);
     const float sin_theta = sinf(theta);
     const float cos_theta = cosf(theta);
 
     const float x0 = x[i + 0];
     const float x1 = x[i + 1];
-
+    //这里用了32个block处理32个头的rope计算
+    //其中每个block中又只有64 
     dst[i + 0] = x0*cos_theta - x1*sin_theta;
     dst[i + 1] = x0*sin_theta + x1*cos_theta;
 }
-
 static __global__ void rope_glm_f32(const float * x, float * dst, const int ncols, const float p, const float block_p, const float theta_scale) {
     const int col = blockDim.x*blockIdx.x + threadIdx.x;
     const int half_n_dims = ncols/4;
@@ -4038,7 +4073,9 @@ static void norm_f32_cuda(const float * x, float * dst, const int ncols, const i
 
 static void rms_norm_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
     GGML_ASSERT(ncols % WARP_SIZE == 0);
-    const dim3 block_dims(WARP_SIZE, 1, 1);
+    const dim3 block_dims(WARP_SIZE, 1, 1); //(32,1,1)
+    //所以调用的cuda的gridDim =(nrows,1,1) ,blockDim = (32,1,1)
+    //也就是说一个block处理一个row的数据，即每32个线程处理一行数据 ，共计nrows行
     rms_norm_f32<<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
 }
 
